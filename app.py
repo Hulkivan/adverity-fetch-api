@@ -38,3 +38,7 @@ def start_fetch():
         return response.json(), 200
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e), "details": e.response.text if e.response else None}), 500
+
+    if __name__ == "__main__":
+        port = int(os.environ.get("PORT", 5000))
+        app.run(host="0.0.0.0", port=port)
