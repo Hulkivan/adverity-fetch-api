@@ -57,3 +57,12 @@ def start_fetch():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/log", methods=["GET"])
+def show_log():
+    try:
+        with open("fetch_log.txt", "r") as f:
+            content = f.read()
+        return f"<pre>{content}</pre>", 200
+    except FileNotFoundError:
+        return "Noch keine Logeinträge vorhanden.", 200
