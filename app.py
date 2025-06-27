@@ -9,8 +9,22 @@ def index():
     return {"message": "Adverity Fetch API ready 🎉"}
 
 @app.route("/start-fetch", methods=["POST"])
+from datetime import datetime
+
+def log_fetch(info: dict):
+    log_entry = (
+        f"{datetime.now().isoformat()} | "
+        f"Datastream: {info.get('datastreamId')} | "
+        f"{info.get('start')} → {info.get('end')} | "
+        f"From: {info.get('instance')} | "
+        f"Prompt: {info.get('rawPrompt', 'n/a')}\n"
+    )
+    with open("fetch_log.txt", "a") as f:
+        f.write(log_entry)
+
 def start_fetch():
     data = request.get_json()
+    log_fetch(data)
 
     instance = data.get("instance")
     token = data.get("token")
