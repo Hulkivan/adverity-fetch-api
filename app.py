@@ -1,6 +1,7 @@
 import os
 from flask import Flask, request, jsonify
 import requests
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -8,9 +9,7 @@ app = Flask(__name__)
 def index():
     return {"message": "Adverity Fetch API ready 🎉"}
 
-@app.route("/start-fetch", methods=["POST"])
-from datetime import datetime
-
+# 🔧 Logging-Funktion (nicht als Route!)
 def log_fetch(info: dict):
     log_entry = (
         f"{datetime.now().isoformat()} | "
@@ -22,6 +21,8 @@ def log_fetch(info: dict):
     with open("fetch_log.txt", "a") as f:
         f.write(log_entry)
 
+# 🚀 Haupt-Endpoint für den Fetch
+@app.route("/start-fetch", methods=["POST"])
 def start_fetch():
     data = request.get_json()
     log_fetch(data)
@@ -53,11 +54,7 @@ def start_fetch():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e), "details": e.response.text if e.response else None}), 500
 
-# ✅ WICHTIG: Diese Zeile muss GANZ UNTEN & AUSSERHALB aller Funktionen stehen
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
+# 📄 Route zur Anzeige des Logfiles im Browser
 @app.route("/log", methods=["GET"])
 def show_log():
     try:
@@ -66,3 +63,8 @@ def show_log():
         return f"<pre>{content}</pre>", 200
     except FileNotFoundError:
         return "Noch keine Logeinträge vorhanden.", 200
+
+# 🔁 Server starten (lokal oder auf Render)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
