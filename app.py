@@ -1,4 +1,5 @@
 import os
+import json
 from flask import Flask, request, jsonify
 import requests
 from datetime import datetime
@@ -21,12 +22,13 @@ def log_to_google_sheet(info: dict):
         info.get('rawPrompt', 'n/a')
     ]
 
-    # Google-Sheets-Verbindung
+    # Google Sheets API via Umgebungsvariable laden
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+    creds_json = json.loads(os.environ["GOOGLE_CREDS_JSON"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
     client = gspread.authorize(creds)
 
-    # Arbeitsblatt öffnen & neue Zeile oben einfügen
+    # Einfügen in Google Sheet
     sheet = client.open_by_key(SHEET_ID)
     worksheet = sheet.sheet1
     worksheet.insert_row(log_entry, index=2)
@@ -39,13 +41,11 @@ def index():
 def start_fetch():
     data = request.get_json()
 
-    # Logging in Google Sheet
     try:
         log_to_google_sheet(data)
     except Exception as log_error:
         print(f"Log-Fehler: {log_error}")
 
-    # Parameter auslesen
     instance = data.get("instance")
     token = data.get("token")
     auth_type = data.get("authType", "Bearer")
