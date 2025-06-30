@@ -18,8 +18,16 @@ def log_fetch(info: dict):
         f"From: {info.get('instance')} | "
         f"Prompt: {info.get('rawPrompt', 'n/a')}\n"
     )
-    with open("fetch_log.txt", "a") as f:
-        f.write(log_entry)
+
+    try:
+        with open("fetch_log.txt", "r") as f:
+            previous = f.read()
+    except FileNotFoundError:
+        previous = ""
+
+    with open("fetch_log.txt", "w") as f:
+        f.write(log_entry + previous)
+
 
 # 🚀 Haupt-Endpoint für den Fetch
 @app.route("/start-fetch", methods=["POST"])
