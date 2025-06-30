@@ -2,39 +2,50 @@ import os
 from flask import Flask, request, jsonify
 import requests
 from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
 
+# Google Sheets Setup
+SHEET_ID = "2PACX-1vT2PrawhYUlDHruV9Pr0LIGQd354S2qFGRrPNVYiN52vg5Nnx57K8jimWuSBmTsbVvwgmM5wZJT-OCZ"
+
+def log_to_google_sheet(info: dict):
+    # Eintrag vorbereiten
+    log_entry = [
+        datetime.now().isoformat(),
+        info.get('datastreamId'),
+        info.get('start'),
+        info.get('end'),
+        info.get('instance'),
+        info.get('rawPrompt', 'n/a')
+    ]
+
+    # Google-Sheets-Verbindung
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+    client = gspread.authorize(creds)
+
+    # Arbeitsblatt öffnen & neue Zeile oben einfügen
+    sheet = client.open_by_key(SHEET_ID)
+    worksheet = sheet.sheet1
+    worksheet.insert_row(log_entry, index=2)
+
 @app.route("/", methods=["GET"])
 def index():
-    return {"message": "Adverity Fetch API ready 🎉"}
+    return {"message": "Adverity Fetch API with Google Sheets Logging 🎉"}
 
-# 🔧 Logging-Funktion (nicht als Route!)
-def log_fetch(info: dict):
-    log_entry = (
-        f"{datetime.now().isoformat()} | "
-        f"Datastream: {info.get('datastreamId')} | "
-        f"{info.get('start')} → {info.get('end')} | "
-        f"From: {info.get('instance')} | "
-        f"Prompt: {info.get('rawPrompt', 'n/a')}\n"
-    )
-
-    try:
-        with open("fetch_log.txt", "r") as f:
-            previous = f.read()
-    except FileNotFoundError:
-        previous = ""
-
-    with open("fetch_log.txt", "w") as f:
-        f.write(log_entry + previous)
-
-
-# 🚀 Haupt-Endpoint für den Fetch
 @app.route("/start-fetch", methods=["POST"])
 def start_fetch():
     data = request.get_json()
-    log_fetch(data)
 
+    # Logging in Google Sheet
+    try:
+        log_to_google_sheet(data)
+    except Exception as log_error:
+        print(f"Log-Fehler: {log_error}")
+
+    # Parameter auslesen
     instance = data.get("instance")
     token = data.get("token")
     auth_type = data.get("authType", "Bearer")
@@ -50,10 +61,7 @@ def start_fetch():
         "Authorization": f"{auth_type} {token}",
         "Content-Type": "application/json"
     }
-    body = {
-        "start": start,
-        "end": end
-    }
+    body = {"start": start, "end": end}
 
     try:
         response = requests.post(url, headers=headers, json=body, timeout=30)
@@ -62,17 +70,6 @@ def start_fetch():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e), "details": e.response.text if e.response else None}), 500
 
-# 📄 Route zur Anzeige des Logfiles im Browser
-@app.route("/log", methods=["GET"])
-def show_log():
-    try:
-        with open("fetch_log.txt", "r") as f:
-            content = f.read()
-        return f"<pre>{content}</pre>", 200
-    except FileNotFoundError:
-        return "Noch keine Logeinträge vorhanden.", 200
-
-# 🔁 Server starten (lokal oder auf Render)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
