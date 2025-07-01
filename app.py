@@ -9,7 +9,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 app = Flask(__name__)
 
 # Google Sheets Setup
-SHEET_ID = "2PACX-1vT2PrawhYUlDHruV9Pr0LIGQd354S2qFGRrPNVYiN52vg5Nnx57K8jimWuSBmTsbVvwgmM5wZJT-OCZ"
+SHEET_ID = "1EZlvkKLfTBiYEbCrQIpFTDviXw3JOeSLTyYOCdPEEec"
 
 def log_to_google_sheet(info: dict):
     # Eintrag vorbereiten
