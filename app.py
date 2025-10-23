@@ -1,3 +1,4 @@
+import threading
 import os
 import json
 from flask import Flask, request, jsonify
@@ -70,14 +71,17 @@ def start_fetch():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e), "details": e.response.text if e.response else None}), 500
 
+import threading
+
 @app.route("/slack", methods=["POST"])
 def slack_command():
     """
     Empfängt Slack Slash Commands wie: /fetch meta 01.06.-02.06.25
     """
     # Slack sendet Form-Data, nicht JSON
-    text = request.form.get('text', '')  # z.B. "meta 01.06.-02.06.25"
+    text = request.form.get('text', '')
     user_name = request.form.get('user_name', 'unknown')
+    response_url = request.form.get('response_url')  # Für delayed response
     
     if not text:
         return jsonify({
@@ -94,10 +98,10 @@ def slack_command():
             "text": "❌ Zu wenig Infos. Beispiel: `/fetch meta 01.06.-02.06.25`"
         })
     
-    datastream_name = parts[0]  # z.B. "meta"
-    date_range = parts[1]  # z.B. "01.06.-02.06.25"
+    datastream_name = parts[0]
+    date_range = parts[1]
     
-    # Datastream-Mapping (case-insensitive)
+    # Datastream-Mapping
     DATASTREAM_MAP = {
         "meta": "674",
         "google": "678",
@@ -113,41 +117,37 @@ def slack_command():
             "text": f"❌ Datastream '{datastream_name}' nicht gefunden.\nVerfügbar: {available}"
         })
     
-    # Datums-Parsing: "01.06.-02.06.25" -> "2025-06-01", "2025-06-02"
+    # Datums-Parsing
     try:
         date_parts = date_range.split('-')
         if len(date_parts) != 2:
             raise ValueError("Ungültiges Format")
         
-        start_str = date_parts[0].strip()  # "01.06."
-        end_str = date_parts[1].strip()    # "02.06.25"
+        start_str = date_parts[0].strip()
+        end_str = date_parts[1].strip()
         
-        # Start-Datum parsen (z.B. "01.06.")
         start_day, start_month = start_str.rstrip('.').split('.')
         
-        # End-Datum parsen (z.B. "02.06.25")
         end_parts = end_str.rstrip('.').split('.')
         end_day = end_parts[0]
         end_month = end_parts[1]
         end_year = end_parts[2] if len(end_parts) > 2 else None
         
-        # Jahr ermitteln (wenn nicht angegeben, aktuelles Jahr nehmen)
         if end_year:
             year = f"20{end_year}" if len(end_year) == 2 else end_year
         else:
             year = str(datetime.now().year)
         
-        # ISO-Format erstellen
         start = f"{year}-{start_month.zfill(2)}-{start_day.zfill(2)}"
         end = f"{year}-{end_month.zfill(2)}-{end_day.zfill(2)}"
         
     except Exception as parse_error:
         return jsonify({
             "response_type": "ephemeral",
-            "text": f"❌ Datumsformat ungültig: {str(parse_error)}\nNutze: DD.MM.-DD.MM.YY (z.B. 01.06.-02.06.25)"
+            "text": f"❌ Datumsformat ungültig: {str(parse_error)}\nNutze: DD.MM.-DD.MM.YY"
         })
     
-    # Credentials aus Umgebungsvariablen
+    # Credentials
     instance = os.environ.get("ADVERITY_INSTANCE")
     token = os.environ.get("ADVERITY_TOKEN")
     
@@ -157,66 +157,76 @@ def slack_command():
             "text": "❌ Server-Konfigurationsfehler (Credentials fehlen)"
         })
     
-    # Log-Daten vorbereiten
-    log_data = {
-        "datastreamId": datastream_id,
-        "start": start,
-        "end": end,
-        "instance": instance,
-        "rawPrompt": f"{user_name}: {text}"
-    }
-    
-    # Fetch ausführen
-    url = f"https://{instance}/api/datastreams/{datastream_id}/fetch_fixed/"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    body = {"start": start, "end": end}
-    
-    try:
-        # Erst loggen (schnell)
+    # Background-Job starten
+    def run_fetch():
+        """Läuft im Hintergrund und sendet Ergebnis zurück an Slack"""
+        log_data = {
+            "datastreamId": datastream_id,
+            "start": start,
+            "end": end,
+            "instance": instance,
+            "rawPrompt": f"{user_name}: {text}"
+        }
+        
+        url = f"https://{instance}/api/datastreams/{datastream_id}/fetch_fixed/"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        body = {"start": start, "end": end}
+        
         try:
-            log_to_google_sheet(log_data)
-        except Exception as log_error:
-            print(f"Sheet-Logging fehlgeschlagen: {log_error}")
-        
-        # API-Call mit längerer Timeout und async handling
-        response = requests.post(url, headers=headers, json=body, timeout=90)
-        
-        # Akzeptiere verschiedene Success-Codes
-        # 200 = OK, 201 = Created, 202 = Accepted (async)
-        if response.status_code in [200, 201, 202]:
+            # Loggen
             try:
-                result = response.json()
-                job_id = result.get('id', result.get('job_id', 'gestartet'))
-            except:
-                job_id = "gestartet"
+                log_to_google_sheet(log_data)
+            except Exception as log_error:
+                print(f"Sheet-Logging fehlgeschlagen: {log_error}")
             
-            return jsonify({
+            # Fetch ausführen
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+            
+            if response.status_code in [200, 201, 202]:
+                try:
+                    result = response.json()
+                    job_id = result.get('id', result.get('job_id', 'gestartet'))
+                except:
+                    job_id = "gestartet"
+                
+                success_msg = {
+                    "response_type": "in_channel",
+                    "text": f"✅ *Fetch erfolgreich!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range} ({start} bis {end})\n🔗 Job-ID: `{job_id}`\n\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
+                }
+                requests.post(response_url, json=success_msg, timeout=5)
+            else:
+                error_msg = {
+                    "response_type": "ephemeral",
+                    "text": f"❌ Adverity-Fehler (HTTP {response.status_code})"
+                }
+                requests.post(response_url, json=error_msg, timeout=5)
+                
+        except requests.exceptions.Timeout:
+            timeout_msg = {
                 "response_type": "in_channel",
-                "text": f"✅ *Fetch gestartet!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range} ({start} bis {end})\n🔗 Job-ID: `{job_id}`\n\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
-            })
-        else:
-            # Fehlerfall
-            error_detail = response.text[:200] if response.text else "Keine Details"
-            return jsonify({
+                "text": f"⏳ *Fetch gestartet (langsame Response)*\n📊 Stream: {datastream_name}\n📅 {date_range}\n\nCheck Adverity für Status.\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
+            }
+            requests.post(response_url, json=timeout_msg, timeout=5)
+            
+        except Exception as e:
+            error_msg = {
                 "response_type": "ephemeral",
-                "text": f"❌ Adverity-Fehler (HTTP {response.status_code})\n```{error_detail}```"
-            })
-        
-    except requests.exceptions.Timeout:
-        # Timeout ist eigentlich OK - Job wurde wahrscheinlich gestartet
-        return jsonify({
-            "response_type": "in_channel",
-            "text": f"⏳ *Fetch wurde gestartet (Timeout)*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range}\n\nDer Job läuft wahrscheinlich - check Adverity für Status.\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": f"❌ Fehler beim Fetch: {str(e)}"
-        })
+                "text": f"❌ Fehler: {str(e)}"
+            }
+            requests.post(response_url, json=error_msg, timeout=5)
+    
+    # Thread starten (nicht blockierend)
+    thread = threading.Thread(target=run_fetch)
+    thread.start()
+    
+    # SOFORT antworten (innerhalb 3 Sekunden für Slack)
+    return jsonify({
+        "response_type": "ephemeral",
+        "text": f"⏳ Starte Fetch für *{datastream_name}* ({date_range})...\n_Du bekommst gleich eine Update-Nachricht_"
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
