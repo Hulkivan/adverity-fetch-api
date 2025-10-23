@@ -194,7 +194,7 @@ def slack_command():
                 
                 success_msg = {
                     "response_type": "in_channel",
-                    "text": f"✅ *Fetch erfolgreich!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range} ({start} bis {end})\n🔗 Job-ID: `{job_id}`\n\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
+                    "text": f"✅ *Fetch erfolgreich!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range} ({start} bis {end})\n🔗 Job-ID: `{job_id}`\n\n<https://{instance}/datastreams/{datastream_id}|Zu Adverity>"
                 }
                 requests.post(response_url, json=success_msg, timeout=5)
             else:
