@@ -175,19 +175,41 @@ def slack_command():
     body = {"start": start, "end": end}
     
     try:
-        # Loggen
-        log_to_google_sheet(log_data)
+        # Erst loggen (schnell)
+        try:
+            log_to_google_sheet(log_data)
+        except Exception as log_error:
+            print(f"Sheet-Logging fehlgeschlagen: {log_error}")
         
-        # API-Call
-        response = requests.post(url, headers=headers, json=body, timeout=30)
-        response.raise_for_status()
-        result = response.json()
+        # API-Call mit längerer Timeout und async handling
+        response = requests.post(url, headers=headers, json=body, timeout=90)
         
-        job_id = result.get('id', 'unknown')
+        # Akzeptiere verschiedene Success-Codes
+        # 200 = OK, 201 = Created, 202 = Accepted (async)
+        if response.status_code in [200, 201, 202]:
+            try:
+                result = response.json()
+                job_id = result.get('id', result.get('job_id', 'gestartet'))
+            except:
+                job_id = "gestartet"
+            
+            return jsonify({
+                "response_type": "in_channel",
+                "text": f"✅ *Fetch gestartet!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range} ({start} bis {end})\n🔗 Job-ID: `{job_id}`\n\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
+            })
+        else:
+            # Fehlerfall
+            error_detail = response.text[:200] if response.text else "Keine Details"
+            return jsonify({
+                "response_type": "ephemeral",
+                "text": f"❌ Adverity-Fehler (HTTP {response.status_code})\n```{error_detail}```"
+            })
         
+    except requests.exceptions.Timeout:
+        # Timeout ist eigentlich OK - Job wurde wahrscheinlich gestartet
         return jsonify({
             "response_type": "in_channel",
-            "text": f"✅ *Fetch gestartet!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range}\n🔗 Job-ID: `{job_id}`\n\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
+            "text": f"⏳ *Fetch wurde gestartet (Timeout)*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range}\n\nDer Job läuft wahrscheinlich - check Adverity für Status.\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
         })
         
     except Exception as e:
