@@ -107,7 +107,7 @@ def slack_command():
         "google": "678",
         "snapchat": "679",
         "tiktok": "675",
-        "Instafollos": "573",
+        "Instafollows": "573",
     }
     
     datastream_id = DATASTREAM_MAP.get(datastream_name.lower())
