@@ -1,5 +1,6 @@
 # app.py (angepasst mit Webhook-Logik)
-
+import time
+import threading
 import os
 import json
 from flask import Flask, request, jsonify, Response # NEU: Response importiert
@@ -146,10 +147,61 @@ def slack_command():
     return Response(status=200)
 
 
-# NEU: Der komplette Webhook-Endpunkt
+# NEUE HILFSFUNKTION: Diese Funktion läuft im Hintergrund und fragt den Job-Status ab
+def poll_adverity_status(job_id, channel_id, thread_ts):
+    """
+    Fragt den Status eines Adverity-Jobs so lange ab, bis er abgeschlossen ist,
+    und postet dann das finale Ergebnis nach Slack.
+    """
+    instance = os.environ.get("ADVERITY_INSTANCE")
+    token = os.environ.get("ADVERITY_TOKEN")
+    status_url = f"https://{instance}/api/jobs/{job_id}/"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # Maximal 30 Minuten warten, um Endlosschleifen zu vermeiden
+    max_wait_time = 30 * 60 
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait_time:
+        try:
+            response = requests.get(status_url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                job_status = data.get("status", "unknown").lower()
+                
+                # Prüfen, ob der Job fertig ist (erfolgreich oder nicht)
+                if job_status not in ["pending", "running", "scheduled"]:
+                    datastream_name = data.get('datastream_name', 'unbekannt') # Annahme
+                    adverity_link = f"<https://{instance}/jobs/{job_id}|Zu Adverity>"
+                    
+                    if job_status in ["completed", "successful", "finished"]:
+                        final_text = f"✅ *Fetch erfolgreich!* (Abgeschlossen)\n📊 Stream: {datastream_name}\n🔗 Job-ID: `{job_id}`\n{adverity_link}"
+                    else:
+                        final_text = f"❌ *Fetch fehlgeschlagen!*\n📊 Stream: {datastream_name}\n🔗 Job-ID: `{job_id}`\n📉 Status: `{job_status}`"
+                    
+                    # Finale Nachricht posten und den Thread beenden
+                    slack_client.chat_postMessage(channel=channel_id, text=final_text, thread_ts=thread_ts)
+                    return # Wichtig: Schleife und Thread beenden
+
+        except Exception as e:
+            print(f"Fehler beim Pollen von Job {job_id}: {e}")
+            # Optional: Eine Fehlermeldung nach Slack posten, dass das Polling gescheitert ist
+            
+        # Wenn nicht fertig, 45 Sekunden warten bis zur nächsten Abfrage
+        time.sleep(45)
+
+    # Fallback, wenn die maximale Wartezeit überschritten wurde
+    timeout_text = f"⌛️ *Fetch-Überwachung Zeitüberschreitung*\nDer Job `{job_id}` läuft noch oder konnte nicht verifiziert werden. Bitte manuell in Adverity prüfen."
+    slack_client.chat_postMessage(channel=channel_id, text=timeout_text, thread_ts=thread_ts)
+
+
+# GEÄNDERTER WEBHOOK-EMPFÄNGER
 @app.route("/adverity-webhook", methods=["POST"])
 def handle_adverity_webhook():
-    """Wird von Adverity aufgerufen, wenn ein Job fertig ist."""
+    """
+    Wird von Adverity SOFORT nach Job-Erstellung aufgerufen.
+    Extrahiert die Job-ID und startet einen Hintergrund-Polling-Prozess.
+    """
     channel_id = request.args.get("channel")
     thread_ts = request.args.get("thread_ts")
 
@@ -157,32 +209,33 @@ def handle_adverity_webhook():
         return "Fehlende URL-Parameter", 400
 
     data = request.json
-    status = data.get("status", "unknown").lower()
-    job_id = data.get("id", "N/A")
-
-    # Rück-Mapping von ID zu Namen für eine schönere Nachricht
-    DATASTREAM_MAP = {"meta": "674", "google": "678", "snapchat": "679", "tiktok": "675", "instafollows": "573"}
-    datastream_name = "unbekannt"
-    # Annahme: das Callback-JSON enthält die datastream ID im Feld "datastream"
-    if 'datastream' in data:
-        for name, ds_id in DATASTREAM_MAP.items():
-            if str(ds_id) == str(data['datastream']):
-                datastream_name = name
-                break
+    # Annahme: Der Callback von Adverity enthält eine Liste von Jobs
+    jobs = data.get("jobs", [])
     
-    instance = os.environ.get("ADVERITY_INSTANCE")
-    #adverity_link = f"<https://{instance}/jobs/{job_id}|Zu Adverity>"
-
-    if status in ["completed", "successful", "finished"]:
-        final_text = f"✅ *Fetch erfolgreich!*\n📊 Stream: {datastream_name}\n🔗 Job-ID: `{job_id}`\n{adverity_link}"
+    if not jobs:
+        # Manchmal ist die Job-ID direkt im Root-Objekt
+        job_id = data.get("id")
+        if not job_id:
+            print("Webhook-Fehler: Keine Job-ID im Payload gefunden.")
+            return "Keine Job-ID gefunden", 400
     else:
-        final_text = f"❌ *Fetch fehlgeschlagen!*\n📊 Stream: {datastream_name}\n🔗 Job-ID: `{job_id}`\n📉 Status: `{status}`"
+        # Den ersten Job aus der Liste nehmen
+        job_id = jobs[0].get("id")
 
-    try:
-        slack_client.chat_postMessage(channel=channel_id, text=final_text, thread_ts=thread_ts)
-    except Exception as e:
-        print(f"Fehler beim Posten der finalen Nachricht: {e}")
+    if not job_id:
+        print("Webhook-Fehler: Job-Objekt enthält keine ID.")
+        return "Job-Objekt enthält keine ID", 400
 
+    # Einen Hintergrund-Thread starten, um den Job-Status zu pollen.
+    # Dies blockiert die Antwort an Adverity nicht.
+    polling_thread = threading.Thread(
+        target=poll_adverity_status,
+        args=(job_id, channel_id, thread_ts)
+    )
+    polling_thread.start()
+
+    # SOFORT eine 200er-Antwort an Adverity senden, um zu bestätigen,
+    # dass wir den Webhook erhalten haben.
     return Response(status=200)
 
 
