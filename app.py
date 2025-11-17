@@ -41,13 +41,11 @@ def log_to_google_sheet(info: dict):
 def execute_and_poll(datastream_id, datastream_name, start, end, date_range, response_url, user_name, text):
     """Führt alle langsamen Operationen im Hintergrund aus: Logging, Fetch-Start und Polling."""
     
-    # SCHRITT 1: Logging sofort ausführen
     log_to_google_sheet({
         "datastreamId": datastream_id, "start": start, "end": end,
         "instance": ADVERITY_INSTANCE, "rawPrompt": f"{user_name}: {text}"
     })
     
-    # SCHRITT 2: Adverity-Job starten
     url = f"https://{ADVERITY_INSTANCE}/api/datastreams/{datastream_id}/fetch_fixed/"
     headers = {"Authorization": f"Bearer {ADVERITY_TOKEN}", "Content-Type": "application/json"}
     body = {"start": start, "end": end}
@@ -63,15 +61,18 @@ def execute_and_poll(datastream_id, datastream_name, start, end, date_range, res
         requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Fehler beim Starten des Adverity-Jobs: {e}"})
         return
 
-    # SCHRITT 3: Polling des Job-Status
     status_url = f"https://{ADVERITY_INSTANCE}/api/jobs/{job_id}/"
-    adverity_link = f"<https://{ADVERITY_INSTANCE}/jobs/{job_id}|Zu Adverity>"
+    adverity_link = f"<https://{ADVERITY_INSTANCE}/jobs/{job_id}"
     max_wait_time = 28 * 60
     start_time = time.time()
 
     while time.time() - start_time < max_wait_time:
         try:
             res = requests.get(status_url, headers=headers, timeout=15).json()
+            
+            # --- HIER IST DIE WICHTIGE DEBUG-ZEILE ---
+            print(f"DEBUG: Adverity Job Status Response for Job {job_id}: {res}")
+            
             status = res.get("status", "unknown").lower()
             if status not in ["pending", "running", "scheduled"]:
                 if status in ["completed", "successful", "finished"]:
@@ -84,19 +85,17 @@ def execute_and_poll(datastream_id, datastream_name, start, end, date_range, res
             print(f"Polling-Fehler für Job {job_id}: {e}")
         time.sleep(45)
 
-    # SCHRITT 4: Timeout-Nachricht
     timeout_text = f"⌛️ *Fetch-Überwachung Zeitüberschreitung* für Stream *{datastream_name}*.\nDer Job `{job_id}` läuft vermutlich noch. Bitte manuell prüfen: {adverity_link}"
     requests.post(response_url, json={"response_type": "in_channel", "text": timeout_text})
 
-# --- Flask Routen ---
+# --- Flask Routen (unverändert) ---
 
 @app.route("/", methods=["GET"])
 def index():
-    return {"message": "Adverity Fetch API (v3.2: Timeout-Fix)"}
+    return {"message": "Adverity Fetch API (v3.3: Debug-Logging)"}
 
 @app.route("/slack", methods=["POST"])
 def slack_command():
-    """NUR NOCH SCHNELLE OPERATIONEN: Parsen und Thread starten."""
     text, user_name, response_url = request.form.get('text', ''), request.form.get('user_name', 'unknown'), request.form.get('response_url')
     
     parts = text.strip().split()
@@ -119,20 +118,13 @@ def slack_command():
     if not all([ADVERITY_INSTANCE, ADVERITY_TOKEN]):
         return jsonify({"response_type": "ephemeral", "text": "Server-Konfigurationsfehler."})
 
-    # Starte den gesamten Prozess im Hintergrund-Thread
     threading.Thread(
         target=execute_and_poll,
-        # NEU: user_name und text werden an den Thread übergeben
         args=(datastream_id, datastream_name, start, end, date_range, response_url, user_name, text)
     ).start()
 
-    # Sende eine sofortige, private Bestätigung an den Nutzer (< 3 Sekunden)
-    return jsonify({
-        "response_type": "ephemeral",
-        "text": f"⏳ Anfrage für *{datastream_name}* ({date_range}) angenommen. Job wird gestartet und überwacht..."
-    })
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Anfrage für *{datastream_name}* ({date_range}) angenommen. Job wird gestartet und überwacht..."})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
