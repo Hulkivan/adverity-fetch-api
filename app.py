@@ -62,7 +62,7 @@ def execute_and_poll(datastream_id, datastream_name, start, end, date_range, res
         return
 
     status_url = f"https://{ADVERITY_INSTANCE}/api/jobs/{job_id}/"
-    adverity_link = f"<https://{ADVERITY_INSTANCE}/jobs/{job_id}"
+    adverity_link = f""
     max_wait_time = 28 * 60
     start_time = time.time()
 
