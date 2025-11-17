@@ -171,7 +171,7 @@ def handle_adverity_webhook():
                 break
     
     instance = os.environ.get("ADVERITY_INSTANCE")
-    adverity_link = f"<https://{instance}/jobs/{job_id}|Zu Adverity>"
+    #adverity_link = f"<https://{instance}/jobs/{job_id}|Zu Adverity>"
 
     if status in ["completed", "successful", "finished"]:
         final_text = f"✅ *Fetch erfolgreich!*\n📊 Stream: {datastream_name}\n🔗 Job-ID: `{job_id}`\n{adverity_link}"
