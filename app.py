@@ -103,6 +103,7 @@ def slack_command():
         "google": "678",
         "snapchat": "679",
         "tiktok": "675",
+        "instafollows": "573",
     }
     
     datastream_id = DATASTREAM_MAP.get(datastream_name.lower())
@@ -187,7 +188,7 @@ def slack_command():
         
         return jsonify({
             "response_type": "in_channel",
-            "text": f"✅ *Fetch gestartet!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range}\n🔗 Job-ID: `{job_id}`\n\n<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
+            "text": f"✅ *Fetch gestartet!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range}\n🔗 Job-ID: `{job_id}`"
         })
         
     except Exception as e:
