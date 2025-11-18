@@ -1,6 +1,6 @@
 import os
 import json
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 import requests
 from datetime import datetime
 import gspread
@@ -25,7 +25,23 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 # --- Hilfsfunktionen ---
 
 def log_to_google_sheet(info: dict):
-    # ... (Diese Funktion bleibt unverändert) ...
+    """Loggt einen Eintrag in das definierte Google Sheet."""
+    try:
+        if not GOOGLE_CREDS_JSON:
+            print("LOGGING-INFO: GOOGLE_CREDS_JSON nicht gefunden, Logging wird übersprungen.")
+            return
+        log_entry = [
+            datetime.now().isoformat(), info.get('datastreamId'), info.get('start'),
+            info.get('end'), info.get('instance'), info.get('rawPrompt', 'n/a')
+        ]
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_json_dict = json.loads(GOOGLE_CREDS_JSON)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json_dict, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SHEET_ID).sheet1
+        sheet.insert_row(log_entry, index=2)
+    except Exception as e:
+        print(f"LOGGING-FEHLER (Google Sheets): {e}")
 
 def send_dm(user_id, message):
     """Sendet eine Direktnachricht an einen Benutzer."""
@@ -34,11 +50,10 @@ def send_dm(user_id, message):
         channel_id = response["channel"]["id"]
         slack_client.chat_postMessage(channel=channel_id, text=message)
     except SlackApiError as e:
-        # Dieser Fehler wird nur in den Server-Logs sichtbar sein
         print(f"Fehler beim Senden der DM an {user_id}: {e.response['error']}")
 
 def execute_and_poll(user_id, datastream_id, datastream_name, start, end, date_range, user_name, text):
-    """Startet den Fetch, pollt den Status und sendet eine DM an den Nutzer."""
+    """Startet den Fetch, pollt den Status und sendet Debug-DMs an den Nutzer."""
     
     send_dm(user_id, f"⚙️ DEBUG: Hintergrundprozess für *{datastream_name}* gestartet. Beginne Adverity-Job-Start.")
     
@@ -49,6 +64,10 @@ def execute_and_poll(user_id, datastream_id, datastream_name, start, end, date_r
     job_id = None
 
     try:
+        log_to_google_sheet({
+            "datastreamId": datastream_id, "start": start, "end": end,
+            "instance": ADVERITY_INSTANCE, "rawPrompt": f"{user_name}: {text}"
+        })
         response = requests.post(url, headers=headers, json=body, timeout=30)
         response.raise_for_status()
         data = response.json()
@@ -73,9 +92,10 @@ def execute_and_poll(user_id, datastream_id, datastream_name, start, end, date_r
             status = res.get("status_display", res.get("status", "unknown")).lower()
             
             poll_count += 1
-            send_dm(user_id, f"⚙️ DEBUG (Poll #{poll_count}): Status für Job `{job_id}` ist `{status}`.")
+            if poll_count == 1: # Nur beim ersten Poll eine Status-DM senden
+                send_dm(user_id, f"⚙️ DEBUG (Poll #{poll_count}): Erster Status für Job `{job_id}` ist `{status}`.")
 
-            if status not in ["pending", "running", "scheduled"]:
+            if status not in ["pending", "running", "scheduled", "in warteschlange", "wird ausgeführt"]:
                 if status in ["completed", "successful", "finished", "erfolgreich", "abgeschlossen"]:
                     final_text = f"✅ Dein Fetch für *{datastream_name}* ist erfolgreich abgeschlossen!\n📅 Zeitraum: {date_range}\n{adverity_link}"
                 else:
@@ -84,27 +104,29 @@ def execute_and_poll(user_id, datastream_id, datastream_name, start, end, date_r
                 return
         except Exception as e:
             send_dm(user_id, f"❌ DEBUG: Ein Fehler ist während des Pollings aufgetreten: {e}")
-        time.sleep(60) # Intervall auf 60s erhöht, um die Anzahl der DMs zu reduzieren
+            return # Thread bei Fehler beenden
+        time.sleep(60)
 
     timeout_text = f"⌛️ Die Überwachung deines Fetches für *{datastream_name}* hat die Zeit überschritten.\nDer Job `{job_id}` läuft vermutlich noch. Bitte manuell prüfen: {adverity_link}"
     send_dm(user_id, timeout_text)
 
-# --- Flask Routen (unverändert, bis auf die execute_and_poll-Argumente) ---
+# --- Flask Routen ---
 @app.route("/", methods=["GET"])
 def index():
-    return {"message": "Adverity Fetch API (v5.1: DM-Debugging)"}
+    return {"message": "Adverity Fetch API (v5.2: Final-Debug)"}
 
 @app.route("/slack", methods=["POST"])
 def slack_command():
     user_id, user_name, text = request.form.get('user_id'), request.form.get('user_name', 'unknown'), request.form.get('text', '')
     
-    # ... (Parsing-Code bleibt unverändert) ...
-    parts, datastream_name, date_range = text.strip().split(), None, None
-    if len(parts) >= 2: datastream_name, date_range = parts[0], parts[1]
-    else: return jsonify({"response_type": "ephemeral", "text": "Format: /fetch name DD.MM.-DD.MM.YY"})
+    parts = text.strip().split()
+    if len(parts) < 2: return jsonify({"response_type": "ephemeral", "text": "Format: /fetch name DD.MM.-DD.MM.YY"})
+    datastream_name, date_range = parts[0], parts[1]
+    
     DATASTREAM_MAP = {"meta": "674", "google": "678", "snapchat": "679", "tiktok": "675", "instafollows": "573"}
     datastream_id = DATASTREAM_MAP.get(datastream_name.lower())
     if not datastream_id: return jsonify({"response_type": "ephemeral", "text": f"Datastream '{datastream_name}' nicht gefunden."})
+    
     try:
         date_parts=date_range.split('-'); start_str, end_str = date_parts[0].strip(), date_parts[1].strip()
         start_day, start_month = start_str.rstrip('.').split('.')
@@ -115,10 +137,12 @@ def slack_command():
     except Exception as e: return jsonify({"response_type": "ephemeral", "text": f"Datumsformat ungültig: {e}"})
 
     if not all([ADVERITY_INSTANCE, ADVERITY_TOKEN, SLACK_BOT_TOKEN]):
-        return jsonify({"response_type": "ephemeral", "text": "Server-Konfigurationsfehler."})
+        return jsonify({"response_type": "ephemeral", "text": "Server-Konfigurationsfehler: Wichtige Umgebungsvariablen fehlen."})
 
     threading.Thread(target=execute_and_poll, args=(user_id, datastream_id, datastream_name, start, end, date_range, user_name, text)).start()
     
-    return jsonify({"response_type": "ephemeral", "text": f"⏳ Anfrage für *{datastream_name}* ({date_range}) angenommen. Ich schicke dir jetzt eine Reihe von Debug-Direktnachrichten..."})
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Anfrage für *{datastream_name}* ({date_range}) angenommen. Ich schicke dir jetzt eine Direktnachricht zur Bestätigung..."})
 
-# log_to_google_sheet und if __name__ ... bleiben unverändert
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
