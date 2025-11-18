@@ -99,7 +99,7 @@ def slack_command():
     fetch_body = {"start": start, "end": end}
     
     adverity_link = f"<https://{ADVERITY_INSTANCE}/jobs/{{job_id}}|Zu Adverity>"
-    final_message_template = f"✅ *Fetch erfolgreich gestartet!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range}\n🔗 Job-ID: `{{job_id}}`\n\nDer Job läuft nun im Hintergrund. Überprüfe den Status hier: {adverity_link}"
+    final_message_template = f"✅ *Fetch erfolgreich gestartet!*\n📊 Stream: {datastream_name}\n📅 Zeitraum: {date_range}\n🔗 Job-ID: `{{job_id}}`\n\nDer Job läuft nun im Hintergrund und sollte in wenigen Minuten abgeschlosen sein."
 
     # --- Hintergrundprozess starten (schnell) ---
     threading.Thread(target=execute_in_background, args=(
