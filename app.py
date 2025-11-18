@@ -22,28 +22,25 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 # --- Client Initialisierung ---
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-
 # --- Hilfsfunktionen ---
 
 def log_to_google_sheet(info: dict):
     # ... (Diese Funktion bleibt unverändert) ...
+
+def send_dm(user_id, message):
+    """Sendet eine Direktnachricht an einen Benutzer."""
     try:
-        if not GOOGLE_CREDS_JSON: return
-        log_entry = [datetime.now().isoformat(), info.get('datastreamId'), info.get('start'), info.get('end'), info.get('instance'), info.get('rawPrompt', 'n/a')]
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(GOOGLE_CREDS_JSON), scope)
-        client = gspread.authorize(creds)
-        client.open_by_key(SHEET_ID).sheet1.insert_row(log_entry, index=2)
-    except Exception as e:
-        print(f"LOGGING-FEHLER (Google Sheets): {e}")
+        response = slack_client.conversations_open(users=user_id)
+        channel_id = response["channel"]["id"]
+        slack_client.chat_postMessage(channel=channel_id, text=message)
+    except SlackApiError as e:
+        # Dieser Fehler wird nur in den Server-Logs sichtbar sein
+        print(f"Fehler beim Senden der DM an {user_id}: {e.response['error']}")
 
 def execute_and_poll(user_id, datastream_id, datastream_name, start, end, date_range, user_name, text):
     """Startet den Fetch, pollt den Status und sendet eine DM an den Nutzer."""
     
-    log_to_google_sheet({
-        "datastreamId": datastream_id, "start": start, "end": end,
-        "instance": ADVERITY_INSTANCE, "rawPrompt": f"{user_name}: {text}"
-    })
+    send_dm(user_id, f"⚙️ DEBUG: Hintergrundprozess für *{datastream_name}* gestartet. Beginne Adverity-Job-Start.")
     
     # Adverity-Job starten
     url = f"https://{ADVERITY_INSTANCE}/api/datastreams/{datastream_id}/fetch_fixed/"
@@ -56,21 +53,28 @@ def execute_and_poll(user_id, datastream_id, datastream_name, start, end, date_r
         response.raise_for_status()
         data = response.json()
         job_id = (data.get("jobs", [{}])[0].get("id") if "jobs" in data and data["jobs"] else data.get("id"))
-        if not job_id: raise ValueError("Konnte Job-ID aus Adverity-Antwort nicht extrahieren.")
+        if not job_id: raise ValueError(f"Konnte Job-ID nicht aus Adverity-Antwort extrahieren. Antwort war: {data}")
     except Exception as e:
-        send_dm(user_id, f"❌ Fehler beim Starten des Adverity-Jobs für *{datastream_name}*: {e}")
+        send_dm(user_id, f"❌ DEBUG: Fehler beim Starten des Adverity-Jobs: {e}")
         return
 
+    send_dm(user_id, f"⚙️ DEBUG: Adverity-Job `{job_id}` erfolgreich gestartet. Beginne Status-Abfrage (Polling)...")
+    
     # Polling des Job-Status
     status_url = f"https://{ADVERITY_INSTANCE}/api/jobs/{job_id}/"
     adverity_link = f"<https://{ADVERITY_INSTANCE}/jobs/{job_id}|Zu Adverity>"
     max_wait_time = 28 * 60
     start_time = time.time()
+    poll_count = 0
 
     while time.time() - start_time < max_wait_time:
         try:
             res = requests.get(status_url, headers=headers, timeout=15).json()
             status = res.get("status_display", res.get("status", "unknown")).lower()
+            
+            poll_count += 1
+            send_dm(user_id, f"⚙️ DEBUG (Poll #{poll_count}): Status für Job `{job_id}` ist `{status}`.")
+
             if status not in ["pending", "running", "scheduled"]:
                 if status in ["completed", "successful", "finished", "erfolgreich", "abgeschlossen"]:
                     final_text = f"✅ Dein Fetch für *{datastream_name}* ist erfolgreich abgeschlossen!\n📅 Zeitraum: {date_range}\n{adverity_link}"
@@ -79,44 +83,28 @@ def execute_and_poll(user_id, datastream_id, datastream_name, start, end, date_r
                 send_dm(user_id, final_text)
                 return
         except Exception as e:
-            print(f"Polling-Fehler für Job {job_id}: {e}")
-        time.sleep(45)
+            send_dm(user_id, f"❌ DEBUG: Ein Fehler ist während des Pollings aufgetreten: {e}")
+        time.sleep(60) # Intervall auf 60s erhöht, um die Anzahl der DMs zu reduzieren
 
     timeout_text = f"⌛️ Die Überwachung deines Fetches für *{datastream_name}* hat die Zeit überschritten.\nDer Job `{job_id}` läuft vermutlich noch. Bitte manuell prüfen: {adverity_link}"
     send_dm(user_id, timeout_text)
 
-def send_dm(user_id, message):
-    """Sendet eine Direktnachricht an einen Benutzer."""
-    try:
-        # Öffne eine DM-Konversation mit dem Nutzer
-        response = slack_client.conversations_open(users=user_id)
-        channel_id = response["channel"]["id"]
-        
-        # Sende die Nachricht in diesem DM-Kanal
-        slack_client.chat_postMessage(channel=channel_id, text=message)
-    except SlackApiError as e:
-        print(f"Fehler beim Senden der DM an {user_id}: {e.response['error']}")
-
-# --- Flask Routen ---
+# --- Flask Routen (unverändert, bis auf die execute_and_poll-Argumente) ---
 @app.route("/", methods=["GET"])
 def index():
-    return {"message": "Adverity Fetch API (v5.0: DM-Benachrichtigung)"}
+    return {"message": "Adverity Fetch API (v5.1: DM-Debugging)"}
 
 @app.route("/slack", methods=["POST"])
 def slack_command():
-    user_id = request.form.get('user_id')
-    user_name = request.form.get('user_name', 'unknown')
-    text = request.form.get('text', '')
+    user_id, user_name, text = request.form.get('user_id'), request.form.get('user_name', 'unknown'), request.form.get('text', '')
     
-    # ... (Ihr gesamter Parsing-Code bleibt hier unverändert) ...
+    # ... (Parsing-Code bleibt unverändert) ...
     parts, datastream_name, date_range = text.strip().split(), None, None
     if len(parts) >= 2: datastream_name, date_range = parts[0], parts[1]
     else: return jsonify({"response_type": "ephemeral", "text": "Format: /fetch name DD.MM.-DD.MM.YY"})
-    
     DATASTREAM_MAP = {"meta": "674", "google": "678", "snapchat": "679", "tiktok": "675", "instafollows": "573"}
     datastream_id = DATASTREAM_MAP.get(datastream_name.lower())
     if not datastream_id: return jsonify({"response_type": "ephemeral", "text": f"Datastream '{datastream_name}' nicht gefunden."})
-    
     try:
         date_parts=date_range.split('-'); start_str, end_str = date_parts[0].strip(), date_parts[1].strip()
         start_day, start_month = start_str.rstrip('.').split('.')
@@ -129,14 +117,8 @@ def slack_command():
     if not all([ADVERITY_INSTANCE, ADVERITY_TOKEN, SLACK_BOT_TOKEN]):
         return jsonify({"response_type": "ephemeral", "text": "Server-Konfigurationsfehler."})
 
-    threading.Thread(
-        target=execute_and_poll,
-        args=(user_id, datastream_id, datastream_name, start, end, date_range, user_name, text)
-    ).start()
+    threading.Thread(target=execute_and_poll, args=(user_id, datastream_id, datastream_name, start, end, date_range, user_name, text)).start()
     
-    return jsonify({"response_type": "ephemeral", "text": f"⏳ Anfrage für *{datastream_name}* ({date_range}) angenommen. Ich schicke dir eine Direktnachricht, wenn der Job fertig ist."})
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Anfrage für *{datastream_name}* ({date_range}) angenommen. Ich schicke dir jetzt eine Reihe von Debug-Direktnachrichten..."})
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
+# log_to_google_sheet und if __name__ ... bleiben unverändert
