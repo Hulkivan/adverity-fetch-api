@@ -91,6 +91,7 @@ def slack_command():
         "google": "678",
         "snapchat": "679",
         "tiktok": "675",
+        "instafollows": "573",
     }
 
     datastream_id = DATASTREAM_MAP.get(datastream_name.lower())
@@ -264,11 +265,11 @@ def slack_command():
     if has_job:
         job_id_text = job_id or "unbekannt"
         base_text = (
-            "✅ *Fetch-Job von Adverity bestätigt.*\n"
+            "✅ *Job von Adverity bestätigt.*\n"
             f"📊 Stream: {datastream_name}\n"
             f"📅 Zeitraum: {start_date} – {end_date}\n"
-            f"🆔 Job ID: {job_id_text}\n"
-            f"<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>\n"
+            #f"🆔 Job ID: {job_id_text}\n"
+            #f"<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>\n"
         )
 
         if op_timeout:
