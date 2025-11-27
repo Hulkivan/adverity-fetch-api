@@ -21,6 +21,8 @@ def log_to_google_sheet(info: dict):
         info.get("end"),
         info.get("instance"),
         info.get("rawPrompt", "n/a"),
+        info.get("status", "n/a"),
+        info.get("errorDetail", "n/a"),
     ]
 
     # Google Sheets API via Umgebungsvariable laden
@@ -45,12 +47,10 @@ def index():
 
 @app.route("/start-fetch", methods=["POST"])
 def start_fetch():
+    """
+    Technischer Endpoint (ohne Slack), bei Bedarf direkt aufrufbar.
+    """
     data = request.get_json()
-
-    try:
-        log_to_google_sheet(data)
-    except Exception as log_error:
-        print(f"Log-Fehler: {log_error}")
 
     instance = data.get("instance")
     token = data.get("token")
@@ -71,18 +71,91 @@ def start_fetch():
 
     try:
         response = requests.post(url, headers=headers, json=body, timeout=30)
-        response.raise_for_status()
-        return response.json(), 200
     except requests.exceptions.RequestException as e:
+        # Netzwerk-/HTTP-Timeout etc.
+        log_data = {
+            "datastreamId": datastream_id,
+            "start": start,
+            "end": end,
+            "instance": instance,
+            "rawPrompt": data.get("rawPrompt", "n/a"),
+            "status": "request_exception",
+            "errorDetail": str(e),
+        }
+        try:
+            log_to_google_sheet(log_data)
+        except Exception as log_err:
+            print(f"Log-Fehler: {log_err}")
+
         return (
             jsonify(
                 {
-                    "error": str(e),
-                    "details": e.response.text if e.response else None,
+                    "error": "RequestException beim Fetch",
+                    "details": str(e),
                 }
             ),
             500,
         )
+
+    # Wir haben eine HTTP-Response, egal ob 2xx oder nicht
+    status_code = response.status_code
+    json_body = None
+    detail = None
+    job_id = None
+
+    try:
+        json_body = response.json()
+        detail = (
+            json_body.get("detail")
+            or json_body.get("error")
+            or json_body.get("message")
+        )
+        job_id = json_body.get("id") or json_body.get("job_id")
+    except ValueError:
+        # kein JSON
+        detail = response.text
+
+    # Logging
+    log_data = {
+        "datastreamId": datastream_id,
+        "start": start,
+        "end": end,
+        "instance": instance,
+        "rawPrompt": data.get("rawPrompt", "n/a"),
+        "status": f"http_{status_code}",
+        "errorDetail": detail or "n/a",
+    }
+    try:
+        log_to_google_sheet(log_data)
+    except Exception as log_err:
+        print(f"Log-Fehler: {log_err}")
+
+    # Erfolgsfall
+    if 200 <= status_code < 300:
+        return jsonify(json_body or {"status": "ok"}), 200
+
+    # Spezieller Fall: operation_timeout – Job läuft trotzdem weiter
+    if detail and "operation_timeout" in str(detail).lower():
+        msg = {
+            "warning": "operation_timeout",
+            "info": "Adverity meldet ein Timeout, der Fetch-Job wurde aber sehr wahrscheinlich gestartet.",
+            "datastreamId": datastream_id,
+            "jobId": job_id,
+            "rawResponse": json_body or response.text,
+        }
+        return jsonify(msg), 202
+
+    # Sonst: echter Fehler
+    return (
+        jsonify(
+            {
+                "error": "Fetch fehlgeschlagen",
+                "status_code": status_code,
+                "details": detail,
+            }
+        ),
+        status_code,
+    )
 
 
 @app.route("/slack", methods=["POST"])
@@ -158,7 +231,7 @@ def slack_command():
         else:
             year = str(datetime.now().year)
 
-        # ISO-Format erstellen (reines Datum) und zu vollständigen Timestamps erweitern
+        # ISO-Format (nur Datum)
         start_date = f"{year}-{start_month.zfill(2)}-{start_day.zfill(2)}"
         end_date = f"{year}-{end_month.zfill(2)}-{end_day.zfill(2)}"
 
@@ -189,16 +262,6 @@ def slack_command():
             }
         )
 
-    # Log-Daten vorbereiten
-    log_data = {
-        "datastreamId": datastream_id,
-        "start": start,
-        "end": end,
-        "instance": instance,
-        "rawPrompt": f"{user_name}: {text}",
-    }
-
-    # Fetch ausführen
     url = f"https://{instance}/api/datastreams/{datastream_id}/fetch_fixed/"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -206,17 +269,62 @@ def slack_command():
     }
     body = {"start": start, "end": end}
 
+    # Log-Basisdaten
+    log_base = {
+        "datastreamId": datastream_id,
+        "start": start,
+        "end": end,
+        "instance": instance,
+        "rawPrompt": f"{user_name}: {text}",
+    }
+
     try:
-        # Loggen
-        log_to_google_sheet(log_data)
-
-        # API-Call
         response = requests.post(url, headers=headers, json=body, timeout=30)
-        response.raise_for_status()
-        result = response.json()
+    except requests.exceptions.RequestException as e:
+        # Netzwerkfehler / Timeout etc.
+        log_data = {**log_base, "status": "request_exception", "errorDetail": str(e)}
+        try:
+            log_to_google_sheet(log_data)
+        except Exception as log_err:
+            print(f"Log-Fehler: {log_err}")
 
-        job_id = result.get("id", "unknown")
+        return jsonify(
+            {
+                "response_type": "ephemeral",
+                "text": f"❌ Fehler beim Fetch (RequestException): {str(e)}",
+            }
+        )
 
+    status_code = response.status_code
+    json_body = None
+    detail = None
+    job_id = None
+
+    try:
+        json_body = response.json()
+        detail = (
+            json_body.get("detail")
+            or json_body.get("error")
+            or json_body.get("message")
+        )
+        job_id = json_body.get("id") or json_body.get("job_id")
+    except ValueError:
+        detail = response.text
+
+    # Logging
+    log_data = {
+        **log_base,
+        "status": f"http_{status_code}",
+        "errorDetail": detail or "n/a",
+    }
+    try:
+        log_to_google_sheet(log_data)
+    except Exception as log_err:
+        print(f"Log-Fehler: {log_err}")
+
+    # Klarer Erfolgsfall (2xx)
+    if 200 <= status_code < 300:
+        job_id_text = job_id or "unbekannt"
         return jsonify(
             {
                 "response_type": "in_channel",
@@ -224,41 +332,40 @@ def slack_command():
                     "✅ *Fetch gestartet!*\n"
                     f"📊 Stream: {datastream_name}\n"
                     f"📅 Zeitraum: {start_date} – {end_date}\n"
-                    f"🆔 Job ID: {job_id}\n"
+                    f"🆔 Job ID: {job_id_text}\n"
                     f"<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
                 ),
             }
         )
-    except requests.exceptions.RequestException as e:
-        detail = None
-        if e.response is not None:
-            try:
-                err_json = e.response.json()
-                detail = (
-                    err_json.get("detail")
-                    or err_json.get("error")
-                    or e.response.text
-                )
-            except ValueError:
-                detail = e.response.text
 
-        msg = f"❌ Fehler beim Fetch: {str(e)}"
-        if detail:
-            msg += f"\nDetails: {detail}"
-
+    # Spezieller Fall: Adverity schickt operation_timeout, Job läuft aber trotzdem
+    if detail and "operation_timeout" in str(detail).lower():
+        job_id_text = job_id or "siehe Adverity UI"
         return jsonify(
             {
-                "response_type": "ephemeral",
-                "text": msg,
+                "response_type": "in_channel",
+                "text": (
+                    "⚠️ *Fetch vermutlich gestartet, aber Adverity meldet `operation_timeout`.*\n"
+                    f"📊 Stream: {datastream_name}\n"
+                    f"📅 Zeitraum: {start_date} – {end_date}\n"
+                    f"🆔 Job ID: {job_id_text}\n"
+                    f"ℹ️ Bitte Status und Ergebnis direkt in Adverity prüfen.\n"
+                    f"<https://{instance}/app/datastreams/{datastream_id}|Zu Adverity>"
+                ),
             }
         )
-    except Exception as e:
-        return jsonify(
-            {
-                "response_type": "ephemeral",
-                "text": f"❌ Unerwarteter Fehler: {str(e)}",
-            }
-        )
+
+    # Alle anderen Fehler
+    msg = "❌ Fetch fehlgeschlagen."
+    if detail:
+        msg += f"\nDetails: {detail}"
+
+    return jsonify(
+        {
+            "response_type": "ephemeral",
+            "text": msg,
+        }
+    )
 
 
 if __name__ == "__main__":
