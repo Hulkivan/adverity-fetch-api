@@ -347,7 +347,7 @@ def poll_jobs():
     Pollt alle Jobs aus dem Google Sheet, die noch "offen" sind (Status nicht done_*,
     aber mit JobId), holt den Status über die Adverity Jobs API und:
     - aktualisiert den Status im Sheet
-    - schickt bei Success/Failed eine Slack-DM an den ursprünglichen Auslöser
+    - schickt bei Success/Failed/Cancelled/Discarded eine Slack-DM an den ursprünglichen Auslöser
     """
     instance_env = os.environ.get("ADVERITY_INSTANCE")
     token = os.environ.get("ADVERITY_TOKEN")
@@ -365,7 +365,6 @@ def poll_jobs():
     if not rows or len(rows) < 2:
         return jsonify({"message": "Keine Log-Einträge gefunden."})
 
-    header = rows[0]
     data_rows = rows[1:]
 
     checked = 0
@@ -381,9 +380,7 @@ def poll_jobs():
         start = row[2]
         end = row[3]
         instance = row[4] or instance_env
-        raw_prompt = row[5]
         status = row[6]
-        error_detail = row[7]
         job_id = row[8].strip()
         trigger_user_id = row[9].strip()
 
@@ -396,7 +393,9 @@ def poll_jobs():
         checked += 1
 
         try:
-            job_url = f"https://{instance}/api/jobs/{job_id}/imported/"
+            # WICHTIG: Direktes Jobs-Objekt abfragen, nicht /imported/,
+            # damit wir sicher an state_label kommen.
+            job_url = f"https://{instance}/api/jobs/{job_id}/"
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -425,14 +424,18 @@ def poll_jobs():
 
         state_label_upper = str(state_label).upper()
 
-        if state_label_upper in ("SUCCESS", "FAILED"):
-            new_status = f"done_{state_label_upper.lower()}"
+        # Terminale Zustände: alles, was nicht mehr läuft
+        TERMINAL_STATES = ("SUCCESS", "FAILED", "CANCELLED", "DISCARDED")
+
+        if state_label_upper in TERMINAL_STATES:
+            suffix = state_label_upper.lower()
+            new_status = f"done_{suffix}"
             try:
-                worksheet.update_cell(idx, 7, new_status)
+                worksheet.update_cell(idx, 7, new_status)  # Status
                 worksheet.update_cell(
                     idx,
                     8,
-                    json.dumps(job_info)[:1000],
+                    json.dumps(job_info)[:1000],  # ErrorDetail / Jobinfo
                 )
                 updated += 1
             except Exception as e:
