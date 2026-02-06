@@ -13,8 +13,7 @@ app = Flask(__name__)
 # -----------------------------
 # Configuration
 # -----------------------------
-SHEET_ID = os.environ.get("SHEET_ID", "").strip()  # empfohlen: als ENV setzen
-POLL_INTERVAL_HINT_MINUTES = 5  # nur Hinweis; echtes Timing kommt über externen Cron
+SHEET_ID = os.environ.get("SHEET_ID", "").strip()
 
 DATASTREAM_MAP = {
     "meta": "674",
@@ -29,17 +28,16 @@ TERMINAL_STATES = {"SUCCESS", "FAILED", "CANCELLED", "DISCARDED"}
 
 
 # -----------------------------
-# Google Sheets helpers
+# Time helpers
 # -----------------------------
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# -----------------------------
+# Google Sheets helpers
+# -----------------------------
 def get_gsheet_worksheet():
-    """
-    Connects to Google Sheet and returns sheet1.
-    Requires GOOGLE_CREDS_JSON env var.
-    """
     if not SHEET_ID:
         raise RuntimeError("SHEET_ID fehlt (bitte als ENV setzen).")
 
@@ -56,8 +54,8 @@ def get_gsheet_worksheet():
 
 def ensure_header():
     """
-    Ensures the sheet has the expected header in row 1.
-    If row 1 is empty, writes header.
+    Header (Row 1) expected:
+    Timestamp | Stream | DatastreamId | Start | End | Instance | RawPrompt | Status | ErrorDetail | JobId | TriggerUserId | TriggerChannelId | NotifiedAt
     """
     ws = get_gsheet_worksheet()
     rows = ws.get_all_values()
@@ -79,16 +77,8 @@ def ensure_header():
         ])
         return
 
-    header = rows[0]
-    if len(header) < 13 or header[0] != "Timestamp" or header[9] != "JobId":
-        # Wir überschreiben nicht blind – nur Hinweis in Logs.
-        print("Hinweis: Sheet-Header weicht ab. Bitte Header prüfen/angleichen.")
-
 
 def log_job_row(info: dict) -> int:
-    """
-    Inserts a row at index 2 and returns the inserted row index (2).
-    """
     ws = get_gsheet_worksheet()
     row = [
         info.get("timestamp", _utc_now_iso()),
@@ -114,45 +104,81 @@ def log_job_row(info: dict) -> int:
 # -----------------------------
 def slack_post_ephemeral(channel_id: str, user_id: str, text: str):
     """
-    Sends an ephemeral message to user in a channel.
-    Requires SLACK_BOT_TOKEN with chat:write.
+    Returns: (ok: bool, error: str|None)
     """
     token = os.environ.get("SLACK_BOT_TOKEN")
     if not token:
-        print("SLACK_BOT_TOKEN fehlt – kann keine Slack Nachricht senden.")
-        return
+        return False, "SLACK_BOT_TOKEN missing"
 
     url = "https://slack.com/api/chat.postEphemeral"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "channel": channel_id,
-        "user": user_id,
-        "text": text,
-    }
+    payload = {"channel": channel_id, "user": user_id, "text": text}
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=8)
         if resp.status_code >= 400:
-            print(f"Slack Ephemeral HTTP Fehler: {resp.status_code} - {resp.text}")
-            return
+            return False, f"http_{resp.status_code}: {resp.text}"
         body = resp.json()
         if not body.get("ok"):
-            print(f"Slack Ephemeral API Fehler: {body}")
+            return False, body.get("error", "unknown_error")
+        return True, None
     except Exception as e:
-        print(f"Slack Ephemeral Exception: {e}")
+        return False, str(e)
+
+
+def slack_dm(user_id: str, text: str):
+    """
+    Fallback DM. Returns (ok, error)
+    """
+    token = os.environ.get("SLACK_BOT_TOKEN")
+    if not token:
+        return False, "SLACK_BOT_TOKEN missing"
+
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"channel": user_id, "text": text}
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=8)
+        if resp.status_code >= 400:
+            return False, f"http_{resp.status_code}: {resp.text}"
+        body = resp.json()
+        if not body.get("ok"):
+            return False, body.get("error", "unknown_error")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def notify_user(trigger_channel_id: str, trigger_user_id: str, text: str):
+    """
+    Try ephemeral in the original channel.
+    If that fails (bot not in channel etc.), fallback to DM.
+    Returns (ok, method, error)
+    """
+    ok, err = slack_post_ephemeral(trigger_channel_id, trigger_user_id, text)
+    if ok:
+        return True, "ephemeral", None
+
+    # fallback DM
+    ok2, err2 = slack_dm(trigger_user_id, text)
+    if ok2:
+        return True, "dm_fallback", None
+
+    # both failed
+    return False, "failed", f"ephemeral_error={err}; dm_error={err2}"
 
 
 # -----------------------------
-# Parsing helpers
+# Parsing
 # -----------------------------
 def parse_date_range(date_range: str):
-    """
-    Expected: DD.MM.-DD.MM.YY (e.g., 09.11.-09.11.25)
-    Returns: (YYYY-MM-DD, YYYY-MM-DD)
-    """
     parts = date_range.split("-")
     if len(parts) != 2:
         raise ValueError("Ungültiges Datumsformat (erwartet DD.MM.-DD.MM.YY)")
@@ -176,28 +202,20 @@ def parse_date_range(date_range: str):
 
 
 # -----------------------------
-# Adverity helpers
+# Adverity
 # -----------------------------
 def adverity_start_fetch(datastream_id: str, start_date: str, end_date: str):
-    """
-    Starts fetch in Adverity and returns job_id.
-    We do NOT interpret any 'success' field as completion.
-    """
     instance = os.environ.get("ADVERITY_INSTANCE")
     token = os.environ.get("ADVERITY_TOKEN")
     if not instance or not token:
         raise RuntimeError("ADVERITY_INSTANCE oder ADVERITY_TOKEN fehlt")
 
     url = f"https://{instance}/api/datastreams/{datastream_id}/fetch_fixed/"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"start": start_date, "end": end_date}
 
     resp = requests.post(url, headers=headers, json=payload, timeout=30)
 
-    # Loggable detail
     try:
         data = resp.json()
         detail = json.dumps(data)[:1000]
@@ -205,7 +223,6 @@ def adverity_start_fetch(datastream_id: str, start_date: str, end_date: str):
         data = None
         detail = (resp.text or "")[:1000]
 
-    # Extract job id
     job_id = ""
     if isinstance(data, dict):
         jobs = data.get("jobs")
@@ -221,19 +238,13 @@ def adverity_start_fetch(datastream_id: str, start_date: str, end_date: str):
 
 
 def adverity_get_job_state(job_id: str):
-    """
-    Returns (state_label, raw_json)
-    """
     instance = os.environ.get("ADVERITY_INSTANCE")
     token = os.environ.get("ADVERITY_TOKEN")
     if not instance or not token:
         raise RuntimeError("ADVERITY_INSTANCE oder ADVERITY_TOKEN fehlt")
 
     url = f"https://{instance}/api/jobs/{job_id}/"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
@@ -243,14 +254,10 @@ def adverity_get_job_state(job_id: str):
 
 
 # -----------------------------
-# Background worker for starting fetch (avoid Slack timeout)
+# Background start to avoid Slack timeout
 # -----------------------------
 def start_fetch_async(stream: str, datastream_id: str, start_date: str, end_date: str,
                      trigger_user_id: str, trigger_channel_id: str, raw_prompt: str):
-    """
-    Starts Adverity fetch and logs to sheet. Does not send completion message.
-    Completion is handled via /poll-jobs.
-    """
     try:
         ensure_header()
     except Exception as e:
@@ -260,10 +267,8 @@ def start_fetch_async(stream: str, datastream_id: str, start_date: str, end_date
 
     try:
         job_id, detail, http_code = adverity_start_fetch(datastream_id, start_date, end_date)
-        status = f"http_{http_code}"
-        error_detail = detail
     except Exception as e:
-        # Log failure to start
+        # Log failure
         try:
             log_job_row({
                 "timestamp": _utc_now_iso(),
@@ -283,11 +288,11 @@ def start_fetch_async(stream: str, datastream_id: str, start_date: str, end_date
         except Exception as log_err:
             print(f"Logging failed (start_failed): {log_err}")
 
-        # Tell user (ephemeral) about start failure
-        slack_post_ephemeral(trigger_channel_id, trigger_user_id, f"❌ Fetch konnte nicht gestartet werden: {e}")
+        # Notify user about start failure (best-effort)
+        notify_user(trigger_channel_id, trigger_user_id, f"❌ Fetch konnte nicht gestartet werden: {e}")
         return
 
-    # Log successful start with job_id and mark as running
+    # Log running
     try:
         log_job_row({
             "timestamp": _utc_now_iso(),
@@ -298,7 +303,7 @@ def start_fetch_async(stream: str, datastream_id: str, start_date: str, end_date
             "instance": instance,
             "raw_prompt": raw_prompt,
             "status": "running",
-            "error_detail": error_detail,
+            "error_detail": f"http_{http_code} {detail}",
             "job_id": job_id,
             "trigger_user_id": trigger_user_id,
             "trigger_channel_id": trigger_channel_id,
@@ -307,17 +312,17 @@ def start_fetch_async(stream: str, datastream_id: str, start_date: str, end_date
     except Exception as log_err:
         print(f"Logging failed (running): {log_err}")
 
-    # Optional: small confirmation to user that job id exists (still not a completion)
-    slack_post_ephemeral(
+    # Optional: user feedback that fetch started (not completion)
+    notify_user(
         trigger_channel_id,
         trigger_user_id,
         f"⏳ Fetch gestartet (Stream: {stream}, Zeitraum: {start_date} – {end_date}). "
-        f"Ich prüfe den Status alle {POLL_INTERVAL_HINT_MINUTES} Minuten und melde mich bei Abschluss."
+        f"Abschlussmeldung kommt automatisch."
     )
 
 
 # -----------------------------
-# Flask routes
+# Routes
 # -----------------------------
 @app.route("/", methods=["GET"])
 def health():
@@ -326,29 +331,17 @@ def health():
 
 @app.route("/slack", methods=["POST"])
 def slack_fetch():
-    """
-    Slack Slash Command:
-      /fetch <stream> <DD.MM.-DD.MM.YY>
-    Example:
-      /fetch instafollows 09.11.-09.11.25
-    """
     text = (request.form.get("text") or "").strip()
     trigger_user_id = request.form.get("user_id", "")
     trigger_channel_id = request.form.get("channel_id", "")
     user_name = request.form.get("user_name", "unknown")
 
     if not text:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": "Bitte nutze: `/fetch <stream> <DD.MM.-DD.MM.YY>`"
-        })
+        return jsonify({"response_type": "ephemeral", "text": "Bitte nutze: `/fetch <stream> <DD.MM.-DD.MM.YY>`"})
 
     parts = text.split()
     if len(parts) < 2:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": "Zu wenig Parameter. Beispiel: `/fetch instafollows 09.11.-09.11.25`"
-        })
+        return jsonify({"response_type": "ephemeral", "text": "Beispiel: `/fetch instafollows 09.11.-09.11.25`"})
 
     stream = parts[0].lower()
     date_range = parts[1]
@@ -370,29 +363,25 @@ def slack_fetch():
     datastream_id = DATASTREAM_MAP[stream]
     raw_prompt = f"{user_name}: /fetch {text}"
 
-    # Immediately ack Slack to avoid timeout; start job in background thread.
+    # ACK immediately (avoid Slack timeout)
     Thread(
         target=start_fetch_async,
         args=(stream, datastream_id, start_date, end_date, trigger_user_id, trigger_channel_id, raw_prompt),
         daemon=True
     ).start()
 
-    return jsonify({
-        "response_type": "ephemeral",
-        "text": "✅ Anfrage angenommen. Ich starte den Fetch jetzt im Hintergrund."
-    })
+    return jsonify({"response_type": "ephemeral", "text": "✅ Anfrage angenommen. Ich starte den Fetch im Hintergrund."})
 
 
 @app.route("/poll-jobs", methods=["GET", "POST"])
 def poll_jobs():
     """
-    Call this every 5 minutes via external cron:
-      GET https://<service>/poll-jobs
+    Call every 5 minutes via external cron:
+      GET https://adverity-fetch.onrender.com/poll-jobs
 
-    Behavior:
-    - Reads sheet rows with Status == "running" and NotifiedAt empty
-    - Checks job status in Adverity
-    - If terminal: updates Status to done_*, sets NotifiedAt, sends ephemeral message to original user in original channel
+    NEW behavior:
+    - Also notifies rows that are already done_* but NotifiedAt is empty (retry / catch-up)
+    - NotifiedAt is set ONLY when Slack notification succeeded
     """
     try:
         ws = get_gsheet_worksheet()
@@ -406,36 +395,54 @@ def poll_jobs():
     checked = 0
     updated = 0
 
-    # Column indices (1-based for gspread update_cell):
-    # 1 Timestamp
-    # 2 Stream
-    # 3 DatastreamId
-    # 4 Start
-    # 5 End
-    # 6 Instance
-    # 7 RawPrompt
-    # 8 Status
-    # 9 ErrorDetail
-    # 10 JobId
-    # 11 TriggerUserId
-    # 12 TriggerChannelId
-    # 13 NotifiedAt
-
     data_rows = rows[1:]
+
     for sheet_row_idx, row in enumerate(data_rows, start=2):
-        # Defensive parsing
         if len(row) < 13:
             continue
 
-        status = (row[7] or "").strip()
-        job_id = (row[9] or "").strip()
+        timestamp = (row[0] or "").strip()
+        stream = (row[1] or "").strip()
+        datastream_id = (row[2] or "").strip()
+        start_date = (row[3] or "").strip()
+        end_date = (row[4] or "").strip()
+        status = (row[7] or "").strip()         # Status
+        job_id = (row[9] or "").strip()         # JobId
+        trigger_user_id = (row[10] or "").strip()
+        trigger_channel_id = (row[11] or "").strip()
         notified_at = (row[12] or "").strip()
 
-        if status != "running":
-            continue
-        if not job_id:
-            continue
+        # We only care if not notified yet
         if notified_at:
+            continue
+
+        # Case A: already done_* but no notification -> send now (catch-up)
+        if status.startswith("done_"):
+            checked += 1
+            # derive final state from status string
+            final_state = status.replace("done_", "").upper()
+            icon = "✅" if final_state == "SUCCESS" else "❌"
+            use_stream = stream or ID_TO_NAME_MAP.get(datastream_id, datastream_id) or "unknown"
+
+            msg = (
+                f"{icon} Dein Adverity-Job ist abgeschlossen.\n"
+                f"• Stream: {use_stream}\n"
+                f"• Zeitraum: {start_date} – {end_date}\n"
+                f"• Job ID: {job_id}\n"
+                f"• Status: {final_state.title()}"
+            )
+
+            ok, method, err = notify_user(trigger_channel_id, trigger_user_id, msg)
+            if ok:
+                ws.update_cell(sheet_row_idx, 13, _utc_now_iso())  # NotifiedAt
+                updated += 1
+            else:
+                # keep NotifiedAt empty so we retry next cron run
+                ws.update_cell(sheet_row_idx, 9, f"notify_error: {err}"[:1000])
+            continue
+
+        # Case B: running -> check Adverity state
+        if status != "running" or not job_id:
             continue
 
         checked += 1
@@ -444,49 +451,41 @@ def poll_jobs():
             state_label, raw = adverity_get_job_state(job_id)
             state_up = str(state_label).upper()
         except Exception as e:
-            # store polling error in ErrorDetail (but keep running)
-            try:
-                ws.update_cell(sheet_row_idx, 9, f"poll_error: {str(e)[:900]}")
-            except Exception as _:
-                pass
+            ws.update_cell(sheet_row_idx, 9, f"poll_error: {str(e)[:900]}")
             continue
 
         if state_up not in TERMINAL_STATES:
             continue
 
-        # Update sheet row: Status + ErrorDetail + NotifiedAt
         done_status = f"done_{state_up.lower()}"
+
+        # Update status + details (but DO NOT set NotifiedAt yet)
         try:
             ws.update_cell(sheet_row_idx, 8, done_status)
             ws.update_cell(sheet_row_idx, 9, json.dumps(raw)[:1000])
-            ws.update_cell(sheet_row_idx, 13, _utc_now_iso())
-            updated += 1
         except Exception as e:
             print(f"Sheet update failed for row {sheet_row_idx}: {e}")
 
-        stream = (row[1] or "").strip() or ID_TO_NAME_MAP.get((row[2] or "").strip(), "unknown")
-        start_date = (row[3] or "").strip()
-        end_date = (row[4] or "").strip()
-        trigger_user_id = (row[10] or "").strip()
-        trigger_channel_id = (row[11] or "").strip()
-
         icon = "✅" if state_up == "SUCCESS" else "❌"
+        use_stream = stream or ID_TO_NAME_MAP.get(datastream_id, datastream_id) or "unknown"
+
         msg = (
             f"{icon} Dein Adverity-Job ist abgeschlossen.\n"
-            f"• Stream: {stream}\n"
+            f"• Stream: {use_stream}\n"
             f"• Zeitraum: {start_date} – {end_date}\n"
             f"• Job ID: {job_id}\n"
             f"• Status: {state_label}"
         )
 
-        if trigger_user_id and trigger_channel_id:
-            slack_post_ephemeral(trigger_channel_id, trigger_user_id, msg)
+        ok, method, err = notify_user(trigger_channel_id, trigger_user_id, msg)
+        if ok:
+            ws.update_cell(sheet_row_idx, 13, _utc_now_iso())  # NotifiedAt only on success
+            updated += 1
+        else:
+            # keep NotifiedAt empty so we retry next cron run
+            ws.update_cell(sheet_row_idx, 9, f"notify_error: {err}"[:1000])
 
-    return jsonify({
-        "message": "Polling abgeschlossen.",
-        "checked_rows": checked,
-        "updated_rows": updated,
-    })
+    return jsonify({"message": "Polling abgeschlossen.", "checked_rows": checked, "updated_rows": updated})
 
 
 if __name__ == "__main__":
